@@ -1,4 +1,6 @@
 import sqlite3
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
@@ -43,9 +45,17 @@ LEFT JOIN feedback_clean   f ON a.student_id = f.student_id
 ORDER BY a.student_id"""
 
 
+# Editable columns of each source (everything except student_id)
+FIELDS = {n: [c for c in REQUIRED[n] if c != "student_id"] for n in FILES}
+
+
 # =====================================================
-# PART 2: Load the 7 sources into SQLite, clean and join with SQL
+# PART 2: SQLite database (load, clean, join, add and edit students)
 # =====================================================
+_LOCK = threading.RLock()
+_MEMORY = {}     # shared in-memory database, used only if campus.db cannot be written
+
+
 def ensure_data():
     """If any CSV is missing (e.g. not pushed to GitHub), create the data."""
     if not all((DATA_DIR / f"{n}.csv").exists() for n in FILES):
@@ -53,56 +63,135 @@ def ensure_data():
         generate_data.main()
 
 
-def _open_db(use_file):
-    """campus.db on disk if it can be written, otherwise an in-memory database."""
-    if use_file:
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            conn.execute("CREATE TABLE IF NOT EXISTS _probe (x)")
-            conn.execute("DROP TABLE _probe")
-            return conn
-        except sqlite3.Error:
-            pass
-    return sqlite3.connect(":memory:")
-
-
-def _integrate(sources, use_file):
-    """Load every source as a table, build the clean views, run the join."""
-    conn = _open_db(use_file)
-    report = {}
+def _connect():
+    """campus.db on disk if it can be written, otherwise one shared in-memory database."""
     try:
+        conn = sqlite3.connect(DB_PATH, timeout=15)
+        conn.execute("CREATE TABLE IF NOT EXISTS _probe (x)")
+        conn.execute("DROP TABLE _probe")
+        return conn, True
+    except sqlite3.Error:
+        if "conn" not in _MEMORY:
+            _MEMORY["conn"] = sqlite3.connect(":memory:", check_same_thread=False)
+        return _MEMORY["conn"], False
+
+
+@contextmanager
+def db():
+    """Open the database, save on success, undo on error."""
+    with _LOCK:
+        conn, is_file = _connect()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            if is_file:
+                conn.close()
+
+
+def _make_views(conn):
+    """<source>_clean keeps the first row per student_id (removes duplicates)."""
+    for name in FILES:
+        conn.execute(f"DROP VIEW IF EXISTS {name}_clean")
+        conn.execute(
+            f"CREATE VIEW {name}_clean AS SELECT * FROM {name} "
+            f"WHERE rowid IN (SELECT MIN(rowid) FROM {name} GROUP BY student_id)")
+
+
+def _load_tables(conn, sources):
+    for name in FILES:
+        sources[name].to_sql(name, conn, if_exists="replace", index=False)
+    _make_views(conn)
+
+
+def _duplicate_report(conn):
+    report = {}
+    for name in FILES:
+        removed = conn.execute(
+            f"SELECT COUNT(*) - COUNT(DISTINCT student_id) FROM {name}").fetchone()[0]
+        if removed > 0:
+            report[f"duplicates removed ({name})"] = int(removed)
+    return report
+
+
+def _tables_ready(conn):
+    have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    return all(n in have for n in FILES)
+
+
+def init_db(force=False):
+    """Fill the database from the CSV files, but only if it is empty (or forced).
+    After that, the database is the source of truth, so edits are kept."""
+    with _LOCK:
+        with db() as conn:
+            if force or not _tables_ready(conn):
+                ensure_data()
+                sources = {n: pd.read_csv(DATA_DIR / f"{n}.csv") for n in FILES}
+                _load_tables(conn, sources)
+            else:
+                _make_views(conn)
+
+
+def reset_database():
+    """Throw away all edits and reload the original CSV files."""
+    init_db(force=True)
+
+
+def next_student_id():
+    init_db()
+    with db() as conn:
+        last = conn.execute("SELECT MAX(student_id) FROM academic").fetchone()[0]
+    try:
+        return f"S{int(str(last)[1:]) + 1:04d}"
+    except (TypeError, ValueError):
+        return "S0001"
+
+
+def _py(v):
+    return v.item() if hasattr(v, "item") else v
+
+
+def save_student(student_id, values):
+    """Insert a new student, or update an existing one, in all 7 tables.
+    values = {column: value} for every column in FIELDS."""
+    absent = [c for n in FILES for c in FIELDS[n] if c not in values]
+    if absent:
+        raise ValueError(f"Missing values for: {', '.join(absent)}")
+    init_db()
+    with db() as conn:
         for name in FILES:
-            sources[name].to_sql(name, conn, if_exists="replace", index=False)
-            conn.execute(f"DROP VIEW IF EXISTS {name}_clean")
-            conn.execute(
-                f"CREATE VIEW {name}_clean AS SELECT * FROM {name} "
-                f"WHERE rowid IN (SELECT MIN(rowid) FROM {name} GROUP BY student_id)")
-            removed = conn.execute(
-                f"SELECT COUNT(*) - COUNT(DISTINCT student_id) FROM {name}"
-            ).fetchone()[0]
-            if removed > 0:
-                report[f"duplicates removed ({name})"] = int(removed)
-        conn.commit()
-        master = pd.read_sql_query(MASTER_SQL, conn)
-    finally:
-        conn.close()
-    return master, report
+            cols = FIELDS[name]
+            vals = [_py(values[c]) for c in cols]
+            sets = ", ".join(f"{c} = ?" for c in cols)
+            cur = conn.execute(f"UPDATE {name} SET {sets} WHERE student_id = ?",
+                               vals + [student_id])
+            if cur.rowcount == 0:
+                marks = ", ".join("?" * (len(cols) + 1))
+                conn.execute(
+                    f"INSERT INTO {name} (student_id, {', '.join(cols)}) VALUES ({marks})",
+                    [student_id] + vals)
 
 
 def load_and_merge(sources=None):
-    """sources=None reads the CSV files in data/. Or pass a dict
-    {name: DataFrame} (for example files uploaded in the dashboard)."""
-    use_file = sources is None
+    """sources=None reads the SQLite database (filled from data/*.csv the first
+    time). Or pass {name: DataFrame}, e.g. files uploaded in the dashboard; those
+    are joined in a temporary in-memory database and nothing is saved."""
     if sources is None:
-        ensure_data()
-        sources = {n: pd.read_csv(DATA_DIR / f"{n}.csv") for n in FILES}
-
-    try:
-        master, report = _integrate(sources, use_file)
-    except sqlite3.Error:
-        if not use_file:
-            raise
-        master, report = _integrate(sources, False)   # fall back to memory
+        init_db()
+        with db() as conn:
+            master = pd.read_sql_query(MASTER_SQL, conn)
+            report = _duplicate_report(conn)
+    else:
+        conn = sqlite3.connect(":memory:")
+        try:
+            _load_tables(conn, sources)
+            master = pd.read_sql_query(MASTER_SQL, conn)
+            report = _duplicate_report(conn)
+        finally:
+            conn.close()
 
     missing = master.isna().sum()
     missing = missing[missing > 0]

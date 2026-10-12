@@ -7,7 +7,8 @@ import plotly.express as px
 import streamlit as st
 
 from pipeline import (build, WEIGHTS, CLUSTER_FEATURES, compute_scores,
-                      add_risk_flags, MASTER_SQL, REQUIRED, FILES)
+                      add_risk_flags, MASTER_SQL, REQUIRED, FILES, FIELDS,
+                      next_student_id, save_student, reset_database)
 
 # ---------- Page setup (must be the first Streamlit command) ----------
 st.set_page_config(page_title="Smart Campus Analytics", page_icon="🎓", layout="wide")
@@ -275,21 +276,21 @@ LAST_NAMES = [
 
 def give_real_names(data):
     """Replace placeholder names like 'Student 12' with unique full names.
-    If the data already has real names, it is left untouched."""
-    placeholder = data["name"].astype(str).str.match(r"^Student \d+$").mean() > 0.5
-    is_old_ravi = (data["student_id"] == "S0001").any()
-    if not (placeholder or (is_old_ravi and data.loc[data["student_id"] == "S0001", "name"].iloc[0] == "Ravi")):
+    Names that were typed in (or already real) are left untouched."""
+    names = data["name"].astype(str)
+    todo = (names.str.match(r"^Student \d+$")
+            | ((data["student_id"] == "S0001") & (names == "Ravi")))
+    if todo.mean() <= 0.5:
         return data
     ids = sorted(data["student_id"])
     rng = np.random.RandomState(7)
     combos = [f"{f} {l}" for f in FIRST_NAMES for l in LAST_NAMES]
     picked = rng.choice(len(combos), len(ids), replace=False)
-    names = [combos[i] for i in picked]
-    mapping = dict(zip(ids, names))
+    mapping = dict(zip(ids, [combos[i] for i in picked]))
     if "S0001" in mapping:
         mapping["S0001"] = "Ravi Kumar"
     data = data.copy()
-    data["name"] = data["student_id"].map(mapping)
+    data.loc[todo, "name"] = data.loc[todo, "student_id"].map(mapping)
     return data
 
 
@@ -542,10 +543,124 @@ def upload_panel():
             st.session_state["custom_sources"] = sources
             st.rerun()
 
+
+# =====================================================
+# Add / edit a student (saved into the SQLite database)
+# =====================================================
+def student_editor():
+    st.subheader("Add or edit a student")
+    if st.session_state.get("custom_sources"):
+        st.info("You are viewing uploaded data. Click 'Back to demo data' in the "
+                "sidebar to add or edit students in the database.")
+        return
+
+    saved = st.session_state.get("last_saved")
+    if saved:
+        st.success(saved)
+    st.caption("Changes are saved into the SQLite database and the whole dashboard "
+               "updates. On the free Streamlit host, saved data is temporary and can "
+               "be lost when the app restarts or goes to sleep.")
+
+    mode = st.radio("What do you want to do?",
+                    ["Add a new student", "Edit an existing student"], horizontal=True)
+    adding = mode == "Add a new student"
+    depts = sorted(df["department"].unique())
+
+    if adding:
+        sid = next_student_id()
+        base = None
+        st.write(f"New student ID: **{sid}**")
+    else:
+        sid = st.selectbox("Student", df["student_id"].tolist(), key="editor_sid",
+                           format_func=lambda x: f"{x} - {name_map[x]}")
+        base = df[df["student_id"] == sid].iloc[0]
+
+    def start(col):
+        v = float(df[col].median()) if base is None else float(base[col])
+        return v
+
+    def num(label, col, lo, hi, whole=False):
+        v = min(max(start(col), lo), hi)
+        key = f"{sid}_{col}_{mode}"
+        if whole:
+            return st.number_input(label, int(lo), int(hi), int(round(v)), 1, key=key)
+        return st.number_input(label, float(lo), float(hi), float(round(v, 1)), 0.1, key=key)
+
+    with st.form(f"editor_{sid}_{mode}"):
+        name = st.text_input("Full name", value="" if base is None else str(base["name"]),
+                             key=f"{sid}_name_{mode}")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**Academic and attendance**")
+            dept = st.selectbox("Department", depts,
+                                index=0 if base is None else depts.index(base["department"]),
+                                key=f"{sid}_dept_{mode}")
+            cgpa = num("CGPA", "cgpa", 0, 10)
+            backlogs = num("Backlogs", "backlogs", 0, 20, True)
+            attendance_pct = num("Attendance %", "attendance_pct", 0, 100)
+        with c2:
+            st.markdown("**LMS and engagement**")
+            logins = num("Logins per week", "logins_per_week", 0, 50, True)
+            assign = num("Assignments completed %", "assignment_completion_pct", 0, 100)
+            events = num("Events", "events", 0, 50, True)
+            clubs = num("Clubs", "clubs", 0, 10, True)
+            hacks = num("Hackathons", "hackathons", 0, 30, True)
+            certs = num("Certifications", "certifications", 0, 30, True)
+        with c3:
+            st.markdown("**Placement, skills and feedback**")
+            apt = num("Aptitude score", "aptitude", 0, 100, True)
+            code = num("Coding score", "coding", 0, 100, True)
+            mock = num("Mock interview score", "mock_interview", 0, 100, True)
+            tech = num("Technical skills", "technical", 0, 100, True)
+            soft = num("Soft skills", "softskill", 0, 100, True)
+            sat = num("Satisfaction (1 to 5)", "satisfaction", 1, 5, True)
+        submitted = st.form_submit_button("💾 Save student")
+
+    if submitted:
+        if not name.strip():
+            st.error("Please enter the student's name.")
+        else:
+            values = dict(name=name.strip(), department=dept, cgpa=cgpa, backlogs=backlogs,
+                          attendance_pct=attendance_pct, logins_per_week=logins,
+                          assignment_completion_pct=assign, events=events, clubs=clubs,
+                          hackathons=hacks, certifications=certs, aptitude=apt,
+                          coding=code, mock_interview=mock, technical=tech,
+                          softskill=soft, satisfaction=sat)
+            ok = False
+            try:
+                save_student(sid, values)
+                ok = True
+            except Exception as err:
+                st.error(f"Could not save: {err}")
+            if ok:
+                get_data.clear()
+                st.session_state["flash"] = {"sid": sid, "action": "added" if adding else "updated"}
+                st.rerun()
+
+    st.markdown("---")
+    if st.button("↩️ Reset database to the original CSV data"):
+        reset_database()
+        get_data.clear()
+        st.session_state["flash"] = {"reset": True}
+        st.rerun()
+
 # =====================================================
 # FACULTY VIEW (all students)
 # =====================================================
 def faculty_view():
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        if flash.get("reset"):
+            msg = "Database reset to the original CSV data."
+        else:
+            r = df[df["student_id"] == flash["sid"]].iloc[0]
+            msg = (f"{r['name']} ({flash['sid']}) {flash['action']}. "
+                   f"Success Score {float(r['success_score']):.1f}, {r['risk_level']} risk, "
+                   f"segment: {r['segment']}. Student login: {flash['sid']} / "
+                   f"{student_password(flash['sid'])}")
+        st.session_state["last_saved"] = msg
+        st.toast(msg, icon="✅")
+
     hero("Student Success Platform",
          "Faculty dashboard: unified view of academic, attendance, LMS, "
          "engagement, placement, skills and feedback data")
@@ -585,8 +700,9 @@ def faculty_view():
     k4.metric("Academic Risk", int(view["academic_risk"].sum()))
     k5.metric("Placement Risk", int(view["placement_risk"].sum()))
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["📊 Overview", "⚠️ At-Risk Students", "🧩 Segments", "🔍 Student Drill-down"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["📊 Overview", "⚠️ At-Risk Students", "🧩 Segments", "🔍 Student Drill-down",
+         "✏️ Add / Edit Student"])
 
     # ---------- Tab 1: Overview ----------
     with tab1:
@@ -714,6 +830,10 @@ def faculty_view():
             "student": [round(float(s[c]), 1) for c in WEIGHTS],
             "class average": [round(float(df[c].mean()), 1) for c in WEIGHTS]})
         st.dataframe(compare, hide_index=True)
+
+    # ---------- Tab 5: Add / edit ----------
+    with tab5:
+        student_editor()
 
 
 # =====================================================
