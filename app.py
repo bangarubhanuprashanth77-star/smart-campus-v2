@@ -6,8 +6,8 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from pipeline import (build, WEIGHTS, CLUSTER_FEATURES,
-                      compute_scores, add_risk_flags)
+from pipeline import (build, WEIGHTS, CLUSTER_FEATURES, compute_scores,
+                      add_risk_flags, MASTER_SQL, REQUIRED, FILES)
 
 # ---------- Page setup (must be the first Streamlit command) ----------
 st.set_page_config(page_title="Smart Campus Analytics", page_icon="🎓", layout="wide")
@@ -294,12 +294,13 @@ def give_real_names(data):
 
 
 @st.cache_data
-def get_data():
-    data, report = build(with_report=True)
+def get_data(sources=None):
+    data, report = build(with_report=True, sources=sources)
     return give_real_names(data), report
 
 
-df, clean_report = get_data()
+custom_sources = st.session_state.get("custom_sources")
+df, clean_report = get_data(custom_sources)
 name_map = dict(zip(df["student_id"], df["name"]))
 
 
@@ -492,6 +493,55 @@ def student_view(sid):
         st.markdown(tip_grid(STUDENT_TIPS), unsafe_allow_html=True)
 
 
+
+# =====================================================
+# Upload your own data (faculty sidebar)
+# =====================================================
+def upload_panel():
+    with st.sidebar.expander("📤 Use your own data"):
+        if st.session_state.get("custom_sources"):
+            st.success("The dashboard is showing your uploaded data.")
+            if st.button("Back to demo data"):
+                del st.session_state["custom_sources"]
+                st.rerun()
+            return
+        st.caption("Upload all 7 CSV files named academic.csv, attendance.csv, "
+                   "lms.csv, engagement.csv, placement.csv, skills.csv and "
+                   "feedback.csv, with the same columns as the demo data.")
+        files = st.file_uploader("CSV files", type="csv", accept_multiple_files=True)
+        if not files:
+            return
+
+        sources, problems = {}, []
+        for f in files:
+            stem = f.name.lower().rsplit(".", 1)[0]
+            if stem in FILES:
+                try:
+                    sources[stem] = pd.read_csv(f)
+                except Exception:
+                    problems.append(f"{f.name} could not be read as a CSV file.")
+        for name in FILES:
+            if name not in sources:
+                problems.append(f"Missing file: {name}.csv")
+            else:
+                absent = [c for c in REQUIRED[name] if c not in sources[name].columns]
+                if absent:
+                    problems.append(f"{name}.csv is missing columns: {', '.join(absent)}")
+        for p in problems:
+            st.warning(p)
+        if problems or not st.button("Use this data"):
+            return
+
+        ok = False
+        try:
+            get_data(sources)          # test run, and cache the result
+            ok = True
+        except Exception as err:
+            st.error(f"These files could not be processed: {err}")
+        if ok:
+            st.session_state["custom_sources"] = sources
+            st.rerun()
+
 # =====================================================
 # FACULTY VIEW (all students)
 # =====================================================
@@ -508,6 +558,9 @@ def faculty_view():
                                   ).set_index("issue"))
         else:
             st.write("No data issues found.")
+        st.caption("The 7 sources are loaded into a SQLite database. Duplicates are "
+                   "removed in the *_clean views, then everything is joined with this SQL:")
+        st.code(MASTER_SQL, language="sql")
 
     st.sidebar.header("Filters")
     all_depts = sorted(df["department"].unique())
@@ -516,6 +569,7 @@ def faculty_view():
     risk = st.sidebar.multiselect("Risk level", ["High", "Medium", "Low"],
                                   default=["High", "Medium", "Low"])
     segs = st.sidebar.multiselect("Segment", all_segs, default=all_segs)
+    upload_panel()
 
     view = df[df["department"].isin(dept)
               & df["risk_level"].isin(risk)

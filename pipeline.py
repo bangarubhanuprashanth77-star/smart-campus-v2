@@ -1,18 +1,50 @@
+import sqlite3
 from pathlib import Path
-from functools import reduce
 
 import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
-DATA_DIR = Path(__file__).parent / "data"
+BASE = Path(__file__).parent
+DATA_DIR = BASE / "data"
+DB_PATH = BASE / "campus.db"
 
 FILES = ["academic", "attendance", "lms", "engagement",
          "placement", "skills", "feedback"]
 
+# Columns every source must have (used to check uploaded files)
+REQUIRED = {
+    "academic":   ["student_id", "name", "department", "cgpa", "backlogs"],
+    "attendance": ["student_id", "attendance_pct"],
+    "lms":        ["student_id", "logins_per_week", "assignment_completion_pct"],
+    "engagement": ["student_id", "events", "clubs", "hackathons", "certifications"],
+    "placement":  ["student_id", "aptitude", "coding", "mock_interview"],
+    "skills":     ["student_id", "technical", "softskill"],
+    "feedback":   ["student_id", "satisfaction"],
+}
+
+# The integration step, written in SQL. Each <source>_clean view keeps the
+# first row per student_id (this removes duplicates), then everything is
+# joined into one row per student.
+MASTER_SQL = """SELECT a.student_id, a.name, a.department, a.cgpa, a.backlogs,
+       t.attendance_pct,
+       l.logins_per_week, l.assignment_completion_pct,
+       e.events, e.clubs, e.hackathons, e.certifications,
+       p.aptitude, p.coding, p.mock_interview,
+       s.technical, s.softskill,
+       f.satisfaction
+FROM academic_clean a
+LEFT JOIN attendance_clean t ON a.student_id = t.student_id
+LEFT JOIN lms_clean        l ON a.student_id = l.student_id
+LEFT JOIN engagement_clean e ON a.student_id = e.student_id
+LEFT JOIN placement_clean  p ON a.student_id = p.student_id
+LEFT JOIN skills_clean     s ON a.student_id = s.student_id
+LEFT JOIN feedback_clean   f ON a.student_id = f.student_id
+ORDER BY a.student_id"""
+
 
 # =====================================================
-# PART 2: Load, clean and merge the 7 data sources
+# PART 2: Load the 7 sources into SQLite, clean and join with SQL
 # =====================================================
 def ensure_data():
     """If any CSV is missing (e.g. not pushed to GitHub), create the data."""
@@ -21,24 +53,56 @@ def ensure_data():
         generate_data.main()
 
 
-def load_and_merge():
-    ensure_data()
+def _open_db(use_file):
+    """campus.db on disk if it can be written, otherwise an in-memory database."""
+    if use_file:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("CREATE TABLE IF NOT EXISTS _probe (x)")
+            conn.execute("DROP TABLE _probe")
+            return conn
+        except sqlite3.Error:
+            pass
+    return sqlite3.connect(":memory:")
+
+
+def _integrate(sources, use_file):
+    """Load every source as a table, build the clean views, run the join."""
+    conn = _open_db(use_file)
     report = {}
+    try:
+        for name in FILES:
+            sources[name].to_sql(name, conn, if_exists="replace", index=False)
+            conn.execute(f"DROP VIEW IF EXISTS {name}_clean")
+            conn.execute(
+                f"CREATE VIEW {name}_clean AS SELECT * FROM {name} "
+                f"WHERE rowid IN (SELECT MIN(rowid) FROM {name} GROUP BY student_id)")
+            removed = conn.execute(
+                f"SELECT COUNT(*) - COUNT(DISTINCT student_id) FROM {name}"
+            ).fetchone()[0]
+            if removed > 0:
+                report[f"duplicates removed ({name})"] = int(removed)
+        conn.commit()
+        master = pd.read_sql_query(MASTER_SQL, conn)
+    finally:
+        conn.close()
+    return master, report
 
-    tables = []
-    for name in FILES:
-        df = pd.read_csv(DATA_DIR / f"{name}.csv")
-        before = len(df)
-        df = df.drop_duplicates(subset="student_id")
-        removed = before - len(df)
-        if removed > 0:
-            report[f"duplicates removed ({name})"] = removed
-        tables.append(df)
 
-    master = reduce(
-        lambda left, right: left.merge(right, on="student_id", how="left"),
-        tables
-    )
+def load_and_merge(sources=None):
+    """sources=None reads the CSV files in data/. Or pass a dict
+    {name: DataFrame} (for example files uploaded in the dashboard)."""
+    use_file = sources is None
+    if sources is None:
+        ensure_data()
+        sources = {n: pd.read_csv(DATA_DIR / f"{n}.csv") for n in FILES}
+
+    try:
+        master, report = _integrate(sources, use_file)
+    except sqlite3.Error:
+        if not use_file:
+            raise
+        master, report = _integrate(sources, False)   # fall back to memory
 
     missing = master.isna().sum()
     missing = missing[missing > 0]
@@ -194,9 +258,9 @@ def segment(df):
     return d
 
 
-def build(with_report=False):
+def build(with_report=False, sources=None):
     """Runs the whole pipeline. The dashboard calls this one function."""
-    master, report = load_and_merge()
+    master, report = load_and_merge(sources)
     d = compute_scores(master)
     d = add_risk_flags(d)
     d = explain(d)
