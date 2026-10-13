@@ -1,4 +1,5 @@
 import hmac
+import html
 import random
 
 import numpy as np
@@ -68,6 +69,22 @@ margin-bottom:18px;box-shadow:0 10px 30px rgba(79,70,229,.25);}
 /* section titles */
 .sec{font-size:1.25rem;font-weight:700;color:var(--text);margin:22px 0 10px;
 padding-bottom:6px;border-bottom:2px solid var(--accent);display:inline-block;}
+
+
+/* info cards: the box grows taller so the full text always stays inside the border */
+.mrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;
+align-items:stretch;margin:6px 0 14px;}
+.mcard{background:var(--card);border:1px solid var(--border);border-left:5px solid var(--accent);
+border-radius:12px;padding:14px 16px;box-shadow:0 2px 8px rgba(79,70,229,.08);
+animation:fadeUp .7s ease both;transition:transform .2s,box-shadow .2s;}
+.mcard:hover{transform:translateY(-4px);box-shadow:0 8px 20px rgba(79,70,229,.2);}
+.ml{color:var(--muted);font-size:.9rem;}
+.mv{color:var(--text);font-size:1.7rem;font-weight:600;line-height:1.25;margin-top:2px;
+overflow-wrap:anywhere;}
+.mn{color:var(--muted);font-size:.85rem;line-height:1.4;margin-top:8px;}
+.md{display:inline-block;margin-top:8px;padding:2px 10px;border-radius:999px;font-size:.85rem;}
+.md.up{background:rgba(16,185,129,.15);color:#10B981;}
+.md.down{background:rgba(239,68,68,.15);color:#EF4444;}
 
 /* stat cards */
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin:6px 0 10px;}
@@ -181,6 +198,19 @@ def hero(title, subtitle, icon="🎓"):
 
 def section(text):
     st.markdown(f'<div class="sec">{text}</div>', unsafe_allow_html=True)
+
+
+def info_cards(cards):
+    """Cards in a row. Each is a dict with: label, value, and optionally
+    note (small text under the value) and delta + tone ('up' or 'down')."""
+    out = []
+    for c in cards:
+        note = f'<div class="mn">{html.escape(c["note"])}</div>' if c.get("note") else ""
+        delta = (f'<div class="md {c.get("tone", "up")}">{html.escape(c["delta"])}</div>'
+                 if c.get("delta") else "")
+        out.append(f'<div class="mcard"><div class="ml">{html.escape(c["label"])}</div>'
+                   f'<div class="mv">{html.escape(str(c["value"]))}</div>{delta}{note}</div>')
+    return f'<div class="mrow">{"".join(out)}</div>'
 
 
 def stat_cards(items):
@@ -439,6 +469,34 @@ def login_screen():
 # =====================================================
 # STUDENT VIEW (only their own data)
 # =====================================================
+
+SEGMENT_INFO = {
+    "High Academic, Low Placement-Ready":
+        "Strong marks, but placement scores (coding, aptitude, mock interviews) are low.",
+    "Disengaged & Struggling":
+        "Low academic score together with low attendance.",
+    "All-Rounders":
+        "Strong academics and good placement readiness.",
+    "Active but Needs Academic Support":
+        "Active in clubs, events and hackathons, but the academic score is below 65.",
+    "Average / Monitor":
+        "No strong signal either way, so routine monitoring is enough.",
+}
+STATUS_INFO = {
+    "Low": "Your score is above 65. You are doing well. Keep it up.",
+    "Medium": "Your score is between 55 and 65. You are on track, with room to grow.",
+    "High": "Your score is below 55. Extra support, such as mentoring, is available to help you.",
+}
+RISK_INFO = {
+    "Low": "Success Score above 65.",
+    "Medium": "Success Score between 55 and 65.",
+    "High": "Success Score below 55.",
+}
+
+
+def segment_help(segment, action):
+    return f"{SEGMENT_INFO.get(segment, '')} Suggested next step: {action}"
+
 STATUS = {"Low": "🟢 Doing well",
           "Medium": "🟡 On track, with room to grow",
           "High": "🟠 Extra support is available"}
@@ -451,10 +509,15 @@ def student_view(sid):
 
     hero(f"Welcome, {s['name']}", f"{sid} · {s['department']} department", icon="👋")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Your Success Score", f"{score:.1f}", f"{delta:+.1f} vs class average")
-    c2.metric("Status", STATUS[str(s["risk_level"])])
-    c3.metric("Group", s["segment"])
+    st.markdown(info_cards([
+        dict(label="Your Success Score", value=f"{score:.1f}",
+             delta=f"{'▲' if delta >= 0 else '▼'} {delta:+.1f} vs class average",
+             tone="up" if delta >= 0 else "down"),
+        dict(label="Status", value=STATUS[str(s["risk_level"])],
+             note=STATUS_INFO[str(s["risk_level"])]),
+        dict(label="Group", value=s["segment"],
+             note=segment_help(s["segment"], s["suggested_action"])),
+    ]), unsafe_allow_html=True)
     st.progress(min(int(score), 100))
 
     impacts = {c: float(s[f"impact_{c}"]) for c in WEIGHTS}
@@ -795,10 +858,13 @@ def faculty_view():
         s = df[df["student_id"] == sid].iloc[0]
 
         st.subheader(f"{s['name']} ({sid}, {s['department']})")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Success Score", f"{float(s['success_score']):.1f}")
-        c2.metric("Risk Level", str(s["risk_level"]))
-        c3.metric("Segment", s["segment"])
+        st.markdown(info_cards([
+            dict(label="Success Score", value=f"{float(s['success_score']):.1f}"),
+            dict(label="Risk Level", value=str(s["risk_level"]),
+                 note=RISK_INFO[str(s["risk_level"])]),
+            dict(label="Segment", value=s["segment"],
+                 note=segment_help(s["segment"], s["suggested_action"])),
+        ]), unsafe_allow_html=True)
 
         if s["academic_risk"]:
             st.error("Academic risk flag: YES")
